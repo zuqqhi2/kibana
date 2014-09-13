@@ -4,14 +4,20 @@ var util = require('util'),
     http = require('http'),
     fs = require('fs'),
     url = require('url'),
-    events = require('events');
+    events = require('events'),
+    path = require('path');
 
-var DEFAULT_PORT = 8000;
+var exec = require('child_process').exec;
+
+var DEFAULT_PORT = 80;
 
 function main(argv) {
   new HttpServer({
-    'GET': createServlet(StaticServlet),
-    'HEAD': createServlet(StaticServlet)
+    'GET'   : createServlet(StaticServlet),
+    'POST'  : createServlet(StaticServlet),
+    'PUT'   : createServlet(StaticServlet),
+    'HEAD'  : createServlet(StaticServlet),
+    'DELETE': createServlet(StaticServlet)
   }).start(Number(argv[2]) || DEFAULT_PORT);
 }
 
@@ -82,25 +88,76 @@ StaticServlet.MimeMap = {
   'jpeg': 'image/jpeg',
   'gif': 'image/gif',
   'png': 'image/png',
-  'svg': 'image/svg+xml'
+  'svg': 'image/svg+xml'
 };
+
+// Common function for getting json data from ES
+function getDataFromES(url, method, postData, successCallback, failCallback, numRetry) {
+  var options = {};
+  var command = '';
+
+  if (method === 'DELETE') {
+    command = 'curl -X DELETE --max-time 20 -H "Accept-Encoding: gzip,deflate" "' + url + '"';
+  } else if (method === 'POST' || method === 'PUT') {
+    command = 'curl --max-time 20 -H "Accept-Encoding: gzip,deflate" -d \'' + postData + '\' "' + url + '"';
+  } else {
+    command = 'curl --max-time 20 -H "Accept-Encoding: gzip,deflate" "' + url + '"';
+  }
+
+  exec(command, function (err, stdout, stderr) {
+    if (!err) {
+      successCallback(stdout);
+    } else {
+      if (numRetry <= 0) failCallback();
+      else getDataFromES(url, method, postData, successCallback, failCallback, numRetry - 1);
+    }
+  });
+}
 
 StaticServlet.prototype.handleRequest = function(req, res) {
   var self = this;
-  if (req.url.pathname === '/') req.url.pathname = '/index.html';
-  var path = ('../src/' + req.url.pathname).replace('//','/').replace(/%(..)/g, function(match, hex){
-    return String.fromCharCode(parseInt(hex, 16));
-  });
-  var parts = path.split('/');
-  if (parts[parts.length-1].charAt(0) === '.')
-    return self.sendForbidden_(req, res, path);
-  fs.stat(path, function(err, stat) {
-    if (err)
-      return self.sendMissing_(req, res, path);
-    if (stat.isDirectory())
-      return self.sendDirectory_(req, res, path);
-    return self.sendFile_(req, res, path);
-  });
+
+  // Reverse Proxy
+  if (/^\/proxy/.test(req.url.pathname)) {
+    var reqpath = req.url.pathname.substr(7);
+    var requrl = 'http://' + reqpath;
+
+    // Define callback funcs
+    var successCallback = function (result) {
+      res.writeHead(200, {'Content-Type' : 'application/json; charset=utf-8'});
+      res.end(result);
+    };
+    var failCallback = function () {
+      res.writeHead(503, {'Content-Type' : 'application/json; charset=utf-8'});
+      res.end("ERROR");
+    };
+
+    if (req.method === 'POST' || req.method === 'PUT') {
+      var postData='';
+      req.on('data', function (data) { postData += data; });
+      req.on('end',function(){
+        getDataFromES(requrl, 'POST', postData, successCallback, failCallback, 3);
+      });
+    } else {
+      getDataFromES(requrl, req.method, '', successCallback, failCallback, 3);
+    }
+  // Normal Kibana Function
+  } else {
+    if (req.url.pathname === '/') req.url.pathname = '/index.html';
+    var path = (__dirname + '/' + req.url.pathname).replace('//','/').replace(/%(..)/g, function(match, hex){
+      return String.fromCharCode(parseInt(hex, 16));
+    });
+    var parts = path.split('/');
+    if (parts[parts.length-1].charAt(0) === '.')
+      return self.sendForbidden_(req, res, path);
+    fs.stat(path, function(err, stat) {
+      if (err)
+        return self.sendMissing_(req, res, path);
+      if (stat.isDirectory())
+        return self.sendDirectory_(req, res, path);
+      return self.sendFile_(req, res, path);
+    });
+  }
 }
 
 StaticServlet.prototype.sendError_ = function(req, res, error) {
